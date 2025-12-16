@@ -239,13 +239,15 @@ app.get("/providers/:id/availability", async (req, res) => {
 
     // 3) working hours for that day
     const wh = await pool.request()
-      .input("pid", sql.Int, providerId)
-      .input("dow", sql.Int, dayOfWeek)
-      .query(`
-        SELECT start_time, end_time
-        FROM provider_working_hours
-        WHERE provider_id=@pid AND day_of_week=@dow
-      `);
+  .input("pid", sql.Int, providerId)
+  .input("dow", sql.Int, dayOfWeek)
+  .query(`
+    SELECT 
+      CONVERT(varchar(5), start_time, 108) AS start_time,
+      CONVERT(varchar(5), end_time, 108) AS end_time
+    FROM provider_working_hours
+    WHERE provider_id=@pid AND day_of_week=@dow
+  `);
 
     if (!wh.recordset.length) return res.json({ slots: [] });
 
