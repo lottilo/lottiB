@@ -10,12 +10,21 @@ const app = express();
 /* ---------------------------------------------
    CORS
 --------------------------------------------- */
-app.use(
-  cors({
-    origin: process.env.FRONTEND_URL || "https://cute-lolly-f257a5.netlify.app",
-    credentials: false, // използваш Bearer token, не cookies
-  })
-);
+const allowedOrigins = [
+  "https://cute-lolly-f257a5.netlify.app"
+];
+
+app.use(cors({
+  origin: function (origin, callback) {
+    if (!origin) return callback(null, true); // Postman / server-to-server
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error("Not allowed by CORS"));
+  },
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+}));
+
+app.options("*", cors());
 
 app.use(express.json());
 
