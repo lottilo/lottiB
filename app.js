@@ -216,6 +216,83 @@ app.post("/bookings", async (req, res) => {
         res.status(500).json({ message: err.message });
     }
 });
+// ✅ Available slots for a provider on a given date + service duration
+app.get("/providers/:id/availability", async (req, res) => {
+  try {
+    const providerId = parseInt(req.params.id, 10);
+    const { date, serviceId } = req.query;
+
+    if (!providerId || !date || !serviceId) {
+      return res.status(400).json({ message: "Missing providerId/date/serviceId" });
+    }
+
+    // 1) service duration
+    const s = await pool.request()
+      .input("sid", sql.Int, parseInt(serviceId, 10))
+      .query("SELECT duration_min FROM services WHERE id=@sid");
+
+    if (!s.recordset.length) return res.status(404).json({ message: "Service not found" });
+    const durationMin = s.recordset[0].duration_min;
+
+    // 2) day of week (0=Sun..6=Sat). JS: 0=Sun..6=Sat (same)
+    const dayOfWeek = new Date(`${date}T00:00:00`).getDay();
+
+    // 3) working hours for that day
+    const wh = await pool.request()
+      .input("pid", sql.Int, providerId)
+      .input("dow", sql.Int, dayOfWeek)
+      .query(`
+        SELECT start_time, end_time
+        FROM provider_working_hours
+        WHERE provider_id=@pid AND day_of_week=@dow
+      `);
+
+    if (!wh.recordset.length) return res.json({ slots: [] });
+
+    const startTime = wh.recordset[0].start_time; // e.g. '09:00:00'
+    const endTime = wh.recordset[0].end_time;     // e.g. '18:00:00'
+
+    // 4) existing bookings for that date
+    const b = await pool.request()
+      .input("pid", sql.Int, providerId)
+      .input("d", sql.Date, new Date(`${date}T00:00:00`))
+      .query(`
+        SELECT start_at, end_at
+        FROM bookings
+        WHERE provider_id=@pid
+          AND CAST(start_at AS date) = @d
+          AND status <> 'cancelled'
+      `);
+
+    const bookings = b.recordset.map(r => ({
+      start: new Date(r.start_at).getTime(),
+      end: new Date(r.end_at).getTime(),
+    }));
+
+    // Helper to build timestamps in local server time
+    const dayStart = new Date(`${date}T${String(startTime).slice(0,5)}:00`);
+    const dayEnd   = new Date(`${date}T${String(endTime).slice(0,5)}:00`);
+
+    // Generate slots every 30 min
+    const stepMin = 30;
+    const slots = [];
+
+    for (let t = dayStart.getTime(); t + durationMin * 60000 <= dayEnd.getTime(); t += stepMin * 60000) {
+      const slotStart = t;
+      const slotEnd = t + durationMin * 60000;
+
+      const overlaps = bookings.some(bk => slotStart < bk.end && slotEnd > bk.start);
+      if (!overlaps) {
+        slots.push(new Date(slotStart).toISOString());
+      }
+    }
+
+    return res.json({ providerId, serviceId: parseInt(serviceId, 10), date, durationMin, slots });
+  } catch (e) {
+    console.error("availability error:", e);
+    return res.status(500).json({ message: e.message });
+  }
+});
 
 /* ---------------------------------------------
    START SERVER (Azure)
