@@ -295,6 +295,81 @@ app.get("/providers/:id/availability", async (req, res) => {
     return res.status(500).json({ message: e.message });
   }
 });
+// ✅ Create booking (client)
+app.post("/bookings", async (req, res) => {
+  try {
+    const { providerId, serviceId, startAt, customerName, customerPhone } = req.body;
+
+    if (!providerId || !serviceId || !startAt || !customerName || !customerPhone) {
+      return res.status(400).json({ message: "Missing fields" });
+    }
+
+    const pid = parseInt(providerId, 10);
+    const sid = parseInt(serviceId, 10);
+
+    // 1) get duration for service
+    const s = await pool.request()
+      .input("sid", sql.Int, sid)
+      .query("SELECT duration_min FROM services WHERE id=@sid");
+
+    if (!s.recordset.length) return res.status(404).json({ message: "Service not found" });
+
+    const durationMin = parseInt(s.recordset[0].duration_min, 10);
+    if (!durationMin || durationMin <= 0) return res.status(400).json({ message: "Invalid service duration" });
+
+    // 2) compute endAt
+    const start = new Date(startAt);
+    if (isNaN(start.getTime())) return res.status(400).json({ message: "Invalid startAt" });
+
+    const end = new Date(start.getTime() + durationMin * 60000);
+
+    // 3) overlap check (any booking that intersects [start, end))
+    const overlap = await pool.request()
+      .input("pid", sql.Int, pid)
+      .input("startAt", sql.DateTime2, start)
+      .input("endAt", sql.DateTime2, end)
+      .query(`
+        SELECT TOP (1) id
+        FROM bookings
+        WHERE provider_id = @pid
+          AND status <> 'cancelled'
+          AND start_at < @endAt
+          AND end_at > @startAt
+      `);
+
+    if (overlap.recordset.length) {
+      return res.status(409).json({ message: "Slot not available" });
+    }
+
+    // 4) insert booking
+    const ins = await pool.request()
+      .input("pid", sql.Int, pid)
+      .input("sid", sql.Int, sid)
+      .input("customerName", sql.NVarChar(200), customerName)
+      .input("customerPhone", sql.NVarChar(50), customerPhone)
+      .input("startAt", sql.DateTime2, start)
+      .input("endAt", sql.DateTime2, end)
+      .input("status", sql.NVarChar(20), "confirmed")
+      .query(`
+        INSERT INTO bookings (provider_id, service_id, customer_name, customer_phone, start_at, end_at, status)
+        OUTPUT INSERTED.id
+        VALUES (@pid, @sid, @customerName, @customerPhone, @startAt, @endAt, @status)
+      `);
+
+    return res.status(201).json({
+      message: "Booking created",
+      bookingId: ins.recordset[0].id,
+      providerId: pid,
+      serviceId: sid,
+      startAt: start.toISOString(),
+      endAt: end.toISOString(),
+      status: "confirmed",
+    });
+  } catch (e) {
+    console.error("create booking error:", e);
+    return res.status(500).json({ message: e.message });
+  }
+});
 
 /* ---------------------------------------------
    START SERVER (Azure)
