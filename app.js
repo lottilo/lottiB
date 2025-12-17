@@ -209,6 +209,32 @@ app.post("/my/services", auth, async (req, res) => {
 });
 
 /* ---------------------------------------------
+   SERVICES (public – client catalog)
+   /providers/:id/services
+--------------------------------------------- */
+app.get("/providers/:id/services", async (req, res) => {
+  try {
+    const providerId = parseInt(req.params.id, 10);
+    if (!providerId) {
+      return res.status(400).json({ message: "Invalid provider id" });
+    }
+
+    const result = await pool.request()
+      .input("pid", sql.Int, providerId)
+      .query(`
+        SELECT id, provider_id, name, price, duration_min
+        FROM services
+        WHERE provider_id = @pid
+        ORDER BY id DESC
+      `);
+
+    res.json(result.recordset);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+/* ---------------------------------------------
    AVAILABILITY (public)
    /providers/:id/availability?date=YYYY-MM-DD&serviceId=1
 --------------------------------------------- */
