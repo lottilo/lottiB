@@ -208,6 +208,49 @@ app.post("/my/services", auth, async (req, res) => {
     res.status(500).json({ message: err.message });
   }
 });
+/* ---------------------------------------------
+   STAFF 
+--------------------------------------------- */
+app.get("/my/staff", auth, async (req, res) => {
+  try {
+    const result = await pool.request()
+      .input("provider_id", sql.Int, req.provider_id)
+      .query(`
+        SELECT id, provider_id, full_name, role, phone, is_active, created_at
+        FROM staff
+        WHERE provider_id = @provider_id
+        ORDER BY is_active DESC, full_name ASC
+      `);
+
+    res.json(result.recordset);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+app.post("/my/staff", auth, async (req, res) => {
+  const { full_name, role, phone } = req.body;
+
+  if (!full_name || !role) {
+    return res.status(400).json({ message: "Липсват име и роля" });
+  }
+
+  try {
+    const ins = await pool.request()
+      .input("provider_id", sql.Int, req.provider_id)
+      .input("full_name", sql.NVarChar(200), full_name)
+      .input("role", sql.NVarChar(50), role)
+      .input("phone", sql.NVarChar(50), phone || null)
+      .query(`
+        INSERT INTO staff (provider_id, full_name, role, phone, is_active)
+        OUTPUT INSERTED.id
+        VALUES (@provider_id, @full_name, @role, @phone, 1)
+      `);
+
+    res.status(201).json({ message: "Специалистът е добавен", id: ins.recordset[0].id });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
 
 /* ---------------------------------------------
    SERVICES (public – client catalog)
