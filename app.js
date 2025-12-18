@@ -12,10 +12,10 @@ const app = express();
 --------------------------------------------- */
 const allowedOrigins = [
   "https://cute-lolly-f257a5.netlify.app",
-  "http://localhost:5173"
+  "http://localhost:5173",
 ];
 
-app.use(cors({
+const corsOptions = {
   origin: function (origin, callback) {
     if (!origin) return callback(null, true); // Postman / server-to-server
     if (allowedOrigins.includes(origin)) return callback(null, true);
@@ -23,10 +23,10 @@ app.use(cors({
   },
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
-}));
+};
 
-app.options("*", cors());
-
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 app.use(express.json());
 
 /* ---------------------------------------------
@@ -44,20 +44,27 @@ const dbConfig = {
   },
 };
 
-let pool;
-
-/* ---------------------------------------------
-   CONNECT TO DATABASE ON START
---------------------------------------------- */
-async function connectDB() {
-  try {
-    pool = await sql.connect(dbConfig);
+// ✅ Stable pool promise (prevents "pool is undefined")
+const poolPromise = new sql.ConnectionPool(dbConfig)
+  .connect()
+  .then((pool) => {
     console.log("✅ Connected to Azure SQL");
-  } catch (err) {
+    return pool;
+  })
+  .catch((err) => {
     console.error("❌ DB connection failed:", err);
+    // IMPORTANT: if DB is down, keep the app alive but endpoints will return 503
+    return null;
+  });
+
+async function getPoolOr503(res) {
+  const pool = await poolPromise;
+  if (!pool) {
+    res.status(503).json({ message: "Базата данни не е налична (DB not ready)" });
+    return null;
   }
+  return pool;
 }
-connectDB();
 
 /* ---------------------------------------------
    JWT MIDDLEWARE
@@ -92,6 +99,9 @@ app.get("/", (req, res) => {
 --------------------------------------------- */
 app.get("/providers", async (req, res) => {
   try {
+    const pool = await getPoolOr503(res);
+    if (!pool) return;
+
     const result = await pool.request().query("SELECT id, name, email, phone FROM Providers");
     res.json(result.recordset);
   } catch (err) {
@@ -110,6 +120,9 @@ app.post("/providers/register", async (req, res) => {
   }
 
   try {
+    const pool = await getPoolOr503(res);
+    if (!pool) return;
+
     const existing = await pool.request()
       .input("email", sql.NVarChar, email)
       .query("SELECT id FROM Providers WHERE email = @email");
@@ -143,6 +156,9 @@ app.post("/providers/login", async (req, res) => {
   const { email, password } = req.body;
 
   try {
+    const pool = await getPoolOr503(res);
+    if (!pool) return;
+
     const result = await pool.request()
       .input("email", sql.NVarChar, email)
       .query("SELECT * FROM Providers WHERE email = @email");
@@ -175,6 +191,9 @@ app.post("/providers/login", async (req, res) => {
 --------------------------------------------- */
 app.get("/my/services", auth, async (req, res) => {
   try {
+    const pool = await getPoolOr503(res);
+    if (!pool) return;
+
     const result = await pool.request()
       .input("provider_id", sql.Int, req.provider_id)
       .query("SELECT * FROM Services WHERE provider_id = @provider_id");
@@ -193,6 +212,9 @@ app.post("/my/services", auth, async (req, res) => {
   }
 
   try {
+    const pool = await getPoolOr503(res);
+    if (!pool) return;
+
     await pool.request()
       .input("provider_id", sql.Int, req.provider_id)
       .input("name", sql.NVarChar, name)
@@ -208,11 +230,15 @@ app.post("/my/services", auth, async (req, res) => {
     res.status(500).json({ message: err.message });
   }
 });
+
 /* ---------------------------------------------
-   STAFF 
+   STAFF (dashboard)
 --------------------------------------------- */
 app.get("/my/staff", auth, async (req, res) => {
   try {
+    const pool = await getPoolOr503(res);
+    if (!pool) return;
+
     const result = await pool.request()
       .input("provider_id", sql.Int, req.provider_id)
       .query(`
@@ -227,6 +253,7 @@ app.get("/my/staff", auth, async (req, res) => {
     res.status(500).json({ message: err.message });
   }
 });
+
 app.post("/my/staff", auth, async (req, res) => {
   const { full_name, role, phone } = req.body;
 
@@ -235,6 +262,9 @@ app.post("/my/staff", auth, async (req, res) => {
   }
 
   try {
+    const pool = await getPoolOr503(res);
+    if (!pool) return;
+
     const ins = await pool.request()
       .input("provider_id", sql.Int, req.provider_id)
       .input("full_name", sql.NVarChar(200), full_name)
@@ -258,6 +288,9 @@ app.post("/my/staff", auth, async (req, res) => {
 --------------------------------------------- */
 app.get("/providers/:id/services", async (req, res) => {
   try {
+    const pool = await getPoolOr503(res);
+    if (!pool) return;
+
     const providerId = parseInt(req.params.id, 10);
     if (!providerId) {
       return res.status(400).json({ message: "Invalid provider id" });
@@ -280,10 +313,12 @@ app.get("/providers/:id/services", async (req, res) => {
 
 /* ---------------------------------------------
    AVAILABILITY (public)
-   /providers/:id/availability?date=YYYY-MM-DD&serviceId=1
 --------------------------------------------- */
 app.get("/providers/:id/availability", async (req, res) => {
   try {
+    const pool = await getPoolOr503(res);
+    if (!pool) return;
+
     const providerId = parseInt(req.params.id, 10);
     const { date, serviceId } = req.query;
 
@@ -291,7 +326,6 @@ app.get("/providers/:id/availability", async (req, res) => {
       return res.status(400).json({ message: "Missing providerId/date/serviceId" });
     }
 
-    // 1) service duration
     const s = await pool.request()
       .input("sid", sql.Int, parseInt(serviceId, 10))
       .query("SELECT duration_min FROM services WHERE id=@sid");
@@ -299,10 +333,8 @@ app.get("/providers/:id/availability", async (req, res) => {
     if (!s.recordset.length) return res.status(404).json({ message: "Service not found" });
     const durationMin = parseInt(s.recordset[0].duration_min, 10) || 60;
 
-    // 2) day of week (0=Sun..6=Sat)
     const dayOfWeek = new Date(`${date}T00:00:00`).getDay();
 
-    // 3) working hours for that day (return time as 'HH:mm')
     const wh = await pool.request()
       .input("pid", sql.Int, providerId)
       .input("dow", sql.Int, dayOfWeek)
@@ -318,10 +350,9 @@ app.get("/providers/:id/availability", async (req, res) => {
       return res.json({ providerId, serviceId: parseInt(serviceId, 10), date, durationMin, slots: [] });
     }
 
-    const startTime = wh.recordset[0].start_time; // '09:00'
-    const endTime = wh.recordset[0].end_time;     // '18:00'
+    const startTime = wh.recordset[0].start_time;
+    const endTime = wh.recordset[0].end_time;
 
-    // 4) existing bookings for that date
     const b = await pool.request()
       .input("pid", sql.Int, providerId)
       .input("d", sql.Date, new Date(`${date}T00:00:00`))
@@ -344,11 +375,7 @@ app.get("/providers/:id/availability", async (req, res) => {
     const stepMin = 30;
     const slots = [];
 
-    for (
-      let t = dayStart.getTime();
-      t + durationMin * 60000 <= dayEnd.getTime();
-      t += stepMin * 60000
-    ) {
+    for (let t = dayStart.getTime(); t + durationMin * 60000 <= dayEnd.getTime(); t += stepMin * 60000) {
       const slotStart = t;
       const slotEnd = t + durationMin * 60000;
 
@@ -368,6 +395,9 @@ app.get("/providers/:id/availability", async (req, res) => {
 --------------------------------------------- */
 app.post("/bookings", async (req, res) => {
   try {
+    const pool = await getPoolOr503(res);
+    if (!pool) return;
+
     const { providerId, serviceId, startAt, customerName, customerPhone } = req.body;
 
     if (!providerId || !serviceId || !startAt || !customerName || !customerPhone) {
@@ -377,7 +407,6 @@ app.post("/bookings", async (req, res) => {
     const pid = parseInt(providerId, 10);
     const sid = parseInt(serviceId, 10);
 
-    // duration
     const s = await pool.request()
       .input("sid", sql.Int, sid)
       .query("SELECT duration_min FROM services WHERE id=@sid");
@@ -391,7 +420,6 @@ app.post("/bookings", async (req, res) => {
 
     const end = new Date(start.getTime() + durationMin * 60000);
 
-    // overlap check
     const overlap = await pool.request()
       .input("pid", sql.Int, pid)
       .input("startAt", sql.DateTime2, start)
@@ -409,7 +437,6 @@ app.post("/bookings", async (req, res) => {
       return res.status(409).json({ message: "Slot not available" });
     }
 
-    // insert
     await pool.request()
       .input("pid", sql.Int, pid)
       .input("sid", sql.Int, sid)
@@ -432,10 +459,12 @@ app.post("/bookings", async (req, res) => {
 
 /* ---------------------------------------------
    BOOKINGS (dashboard list) - auth
-   /my/bookings?from=YYYY-MM-DD&to=YYYY-MM-DD
 --------------------------------------------- */
 app.get("/my/bookings", auth, async (req, res) => {
   try {
+    const pool = await getPoolOr503(res);
+    if (!pool) return;
+
     const { from, to } = req.query;
 
     const fromDt = from ? new Date(`${from}T00:00:00`) : null;
@@ -470,14 +499,15 @@ app.get("/my/bookings", auth, async (req, res) => {
     res.status(500).json({ message: err.message });
   }
 });
+
 /* ---------------------------------------------
    WORKING HOURS (dashboard) - auth
-   Table: provider_working_hours(provider_id, day_of_week, start_time, end_time)
 --------------------------------------------- */
-
-// Get my working hours
 app.get("/my/working-hours", auth, async (req, res) => {
   try {
+    const pool = await getPoolOr503(res);
+    if (!pool) return;
+
     const result = await pool.request()
       .input("provider_id", sql.Int, req.provider_id)
       .query(`
@@ -493,21 +523,21 @@ app.get("/my/working-hours", auth, async (req, res) => {
   }
 });
 
-// Upsert my working hours (array)
 app.put("/my/working-hours", auth, async (req, res) => {
   try {
-    const { hours } = req.body; // [{day_of_week:0..6, start_time:"09:00", end_time:"18:00"}]
+    const pool = await getPoolOr503(res);
+    if (!pool) return;
+
+    const { hours } = req.body;
 
     if (!Array.isArray(hours)) {
       return res.status(400).json({ message: "Invalid payload" });
     }
 
-    // delete old
     await pool.request()
       .input("provider_id", sql.Int, req.provider_id)
       .query(`DELETE FROM provider_working_hours WHERE provider_id=@provider_id`);
 
-    // insert new
     for (const h of hours) {
       const dow = Number(h.day_of_week);
       const st = String(h.start_time || "");
@@ -540,4 +570,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 API running on port ${PORT}`);
 });
+
 
