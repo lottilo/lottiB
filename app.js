@@ -11,7 +11,8 @@ const app = express();
    CORS
 --------------------------------------------- */
 const allowedOrigins = [
-  "https://cute-lolly-f257a5.netlify.app"
+  "https://cute-lolly-f257a5.netlify.app",
+  "http://localhost:5173"
 ];
 
 app.use(cors({
