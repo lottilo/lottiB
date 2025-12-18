@@ -426,6 +426,68 @@ app.get("/my/bookings", auth, async (req, res) => {
     res.status(500).json({ message: err.message });
   }
 });
+/* ---------------------------------------------
+   WORKING HOURS (dashboard) - auth
+   Table: provider_working_hours(provider_id, day_of_week, start_time, end_time)
+--------------------------------------------- */
+
+// Get my working hours
+app.get("/my/working-hours", auth, async (req, res) => {
+  try {
+    const result = await pool.request()
+      .input("provider_id", sql.Int, req.provider_id)
+      .query(`
+        SELECT day_of_week, start_time, end_time
+        FROM provider_working_hours
+        WHERE provider_id = @provider_id
+        ORDER BY day_of_week
+      `);
+
+    res.json(result.recordset);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// Upsert my working hours (array)
+app.put("/my/working-hours", auth, async (req, res) => {
+  try {
+    const { hours } = req.body; // [{day_of_week:0..6, start_time:"09:00", end_time:"18:00"}]
+
+    if (!Array.isArray(hours)) {
+      return res.status(400).json({ message: "Invalid payload" });
+    }
+
+    // delete old
+    await pool.request()
+      .input("provider_id", sql.Int, req.provider_id)
+      .query(`DELETE FROM provider_working_hours WHERE provider_id=@provider_id`);
+
+    // insert new
+    for (const h of hours) {
+      const dow = Number(h.day_of_week);
+      const st = String(h.start_time || "");
+      const et = String(h.end_time || "");
+
+      if (!(dow >= 0 && dow <= 6)) continue;
+      if (!st || !et) continue;
+
+      await pool.request()
+        .input("provider_id", sql.Int, req.provider_id)
+        .input("dow", sql.Int, dow)
+        .input("st", sql.VarChar(5), st)
+        .input("et", sql.VarChar(5), et)
+        .query(`
+          INSERT INTO provider_working_hours (provider_id, day_of_week, start_time, end_time)
+          VALUES (@provider_id, @dow, @st, @et)
+        `);
+    }
+
+    res.json({ message: "Работното време е запазено" });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
 
 /* ---------------------------------------------
    START SERVER (Azure)
