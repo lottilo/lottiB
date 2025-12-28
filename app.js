@@ -11,7 +11,7 @@ const app = express();
    CORS
 --------------------------------------------- */
 const allowedOrigins = [
-  "https://cute-lolly-f257a5.netlify.app",
+  "https://lottii.netlify.app/",
   "http://localhost:5173",
 ];
 
@@ -196,7 +196,16 @@ app.get("/my/services", auth, async (req, res) => {
 
     const result = await pool.request()
       .input("provider_id", sql.Int, req.provider_id)
-      .query("SELECT * FROM Services WHERE provider_id = @provider_id");
+      .query(`
+        SELECT 
+          s.*,
+          st.full_name AS staff_name,
+          st.role AS staff_role
+        FROM services s
+        LEFT JOIN staff st ON st.id = s.staff_id
+        WHERE s.provider_id = @provider_id
+        ORDER BY s.id DESC
+      `);
 
     res.json(result.recordset);
   } catch (err) {
@@ -205,7 +214,7 @@ app.get("/my/services", auth, async (req, res) => {
 });
 
 app.post("/my/services", auth, async (req, res) => {
-  const { name, price, duration_min } = req.body;
+  const { name, price, duration_min, staff_id } = req.body;
 
   if (!name || price == null) {
     return res.status(400).json({ message: "Липсват задължителни полета" });
@@ -220,9 +229,10 @@ app.post("/my/services", auth, async (req, res) => {
       .input("name", sql.NVarChar, name)
       .input("price", sql.Decimal(10, 2), price)
       .input("duration_min", sql.Int, duration_min || 60)
+      .input("staff_id", sql.Int, staff_id ?? null)
       .query(`
-        INSERT INTO Services (provider_id, name, price, duration_min)
-        VALUES (@provider_id, @name, @price, @duration_min)
+        INSERT INTO services (provider_id, name, price, duration_min, staff_id)
+        VALUES (@provider_id, @name, @price, @duration_min, @staff_id)
       `);
 
     res.status(201).json({ message: "Услугата е добавена" });
