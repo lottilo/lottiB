@@ -1,3 +1,5 @@
+require("dotenv").config();
+
 // app.js
 const express = require("express");
 const sql = require("mssql");
