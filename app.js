@@ -12,6 +12,7 @@ const app = express();
 --------------------------------------------- */
 const allowedOrigins = [
   "https://lottii.netlify.app/",
+  "https://www.lottii.netlify.app",
   "http://localhost:5173",
 ];
 
