@@ -10,17 +10,22 @@ const app = express();
 /* ---------------------------------------------
    CORS
 --------------------------------------------- */
-const allowedOrigins = [
-  "https://lottii.netlify.app/",
-  "https://www.lottii.netlify.app",
-  "http://localhost:5173",
-];
-
 const corsOptions = {
   origin: function (origin, callback) {
-    if (!origin) return callback(null, true); // Postman / server-to-server
-    if (allowedOrigins.includes(origin)) return callback(null, true);
-    return callback(new Error("Not allowed by CORS"));
+    // Postman / server-to-server
+    if (!origin) return callback(null, true);
+
+    // Local dev
+    if (origin === "http://localhost:5173") return callback(null, true);
+
+    // Allow your Netlify domain + any Netlify deploy subdomains (safe enough for now)
+    // Examples:
+    // https://lottii.netlify.app
+    // https://www.lottii.netlify.app
+    // https://deploy-preview-123--lottii.netlify.app
+    if (/^https:\/\/(.+\.)?lottii\.netlify\.app$/.test(origin)) return callback(null, true);
+
+    return callback(null, false);
   },
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
@@ -28,7 +33,6 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
-app.use(express.json());
 
 /* ---------------------------------------------
    DATABASE CONFIG (Azure SQL)
