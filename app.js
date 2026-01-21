@@ -20,11 +20,7 @@ const corsOptions = {
     // Local dev
     if (origin === "http://localhost:5173") return callback(null, true);
 
-    // Allow your Netlify domain + any Netlify deploy subdomains (safe enough for now)
-    // Examples:
-    // https://lottii.netlify.app
-    // https://www.lottii.netlify.app
-    // https://deploy-preview-123--lottii.netlify.app
+    // Allow your Netlify domain + any Netlify deploy subdomains
     if (/^https:\/\/(.+\.)?lottii\.netlify\.app$/.test(origin)) return callback(null, true);
 
     return callback(null, false);
@@ -36,7 +32,7 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 
-app.use(express.json()); // ✅ ДОБАВИ ТОВА (важно!)
+app.use(express.json());
 
 /* ---------------------------------------------
    DATABASE CONFIG (Azure SQL)
@@ -47,32 +43,56 @@ const dbConfig = {
   server: process.env.DB_HOST,
   database: process.env.DB_NAME,
   port: Number(process.env.DB_PORT) || 1433,
+
+  // ✅ Important for Azure / cold starts / transient network hiccups
+  connectionTimeout: 60000,
+  requestTimeout: 60000,
+
+  pool: {
+    max: 10,
+    min: 0,
+    idleTimeoutMillis: 30000,
+  },
+
   options: {
     encrypt: true,
     enableArithAbort: true,
   },
 };
 
-// ✅ Stable pool promise (prevents "pool is undefined")
-const poolPromise = new sql.ConnectionPool(dbConfig)
-  .connect()
-  .then((pool) => {
-    console.log("✅ Connected to Azure SQL");
-    return pool;
-  })
-  .catch((err) => {
-    console.error("❌ DB connection failed:", err);
-    // IMPORTANT: if DB is down, keep the app alive but endpoints will return 503
-    return null;
-  });
+// ✅ Reconnect-on-demand pool (prevents "stuck null pool" after one failure)
+let pool = null;
+let poolConnecting = null;
 
 async function getPoolOr503(res) {
-  const pool = await poolPromise;
-  if (!pool) {
-    res.status(503).json({ message: "Базата данни не е налична (DB not ready)" });
+  try {
+    if (pool) return pool;
+
+    if (poolConnecting) {
+      pool = await poolConnecting;
+      return pool;
+    }
+
+    poolConnecting = new sql.ConnectionPool(dbConfig).connect();
+    pool = await poolConnecting;
+
+    console.log("✅ Connected to Azure SQL");
+    return pool;
+  } catch (err) {
+    console.error("❌ DB connection failed:", err);
+
+    // allow retry on next request
+    pool = null;
+    poolConnecting = null;
+
+    if (res) {
+      res.status(503).json({
+        message: "Базата данни не е налична (DB not ready)",
+        hint: err?.code || err?.message || "unknown",
+      });
+    }
     return null;
   }
-  return pool;
 }
 
 /* ---------------------------------------------
@@ -104,14 +124,30 @@ app.get("/", (req, res) => {
 });
 
 /* ---------------------------------------------
+   HEALTH CHECK (DB)
+--------------------------------------------- */
+app.get("/healthz", async (req, res) => {
+  try {
+    const p = await getPoolOr503(null);
+    if (!p) {
+      return res.status(503).json({ status: "degraded", db: "down" });
+    }
+    await p.request().query("SELECT 1");
+    return res.json({ status: "ok", db: "up" });
+  } catch (e) {
+    return res.status(503).json({ status: "degraded", db: "down", error: e.message });
+  }
+});
+
+/* ---------------------------------------------
    PROVIDERS (public list)
 --------------------------------------------- */
 app.get("/providers", async (req, res) => {
   try {
-    const pool = await getPoolOr503(res);
-    if (!pool) return;
+    const p = await getPoolOr503(res);
+    if (!p) return;
 
-    const result = await pool.request().query("SELECT id, name, email, phone FROM Providers");
+    const result = await p.request().query("SELECT id, name, email, phone FROM Providers");
     res.json(result.recordset);
   } catch (err) {
     res.status(500).json({ message: err.message });
@@ -129,10 +165,10 @@ app.post("/providers/register", async (req, res) => {
   }
 
   try {
-    const pool = await getPoolOr503(res);
-    if (!pool) return;
+    const p = await getPoolOr503(res);
+    if (!p) return;
 
-    const existing = await pool.request()
+    const existing = await p.request()
       .input("email", sql.NVarChar, email)
       .query("SELECT id FROM Providers WHERE email = @email");
 
@@ -142,10 +178,10 @@ app.post("/providers/register", async (req, res) => {
 
     const hash = await bcrypt.hash(password, 10);
 
-    await pool.request()
+    await p.request()
       .input("name", sql.NVarChar, name)
       .input("email", sql.NVarChar, email)
-      .input("phone", sql.NVarChar, phone)
+      .input("phone", sql.NVarChar, phone || null)
       .input("password_hash", sql.NVarChar, hash)
       .query(`
         INSERT INTO Providers (name, email, phone, password_hash)
@@ -165,10 +201,10 @@ app.post("/providers/login", async (req, res) => {
   const { email, password } = req.body;
 
   try {
-    const pool = await getPoolOr503(res);
-    if (!pool) return;
+    const p = await getPoolOr503(res);
+    if (!p) return;
 
-    const result = await pool.request()
+    const result = await p.request()
       .input("email", sql.NVarChar, email)
       .query("SELECT * FROM Providers WHERE email = @email");
 
@@ -200,10 +236,10 @@ app.post("/providers/login", async (req, res) => {
 --------------------------------------------- */
 app.get("/my/services", auth, async (req, res) => {
   try {
-    const pool = await getPoolOr503(res);
-    if (!pool) return;
+    const p = await getPoolOr503(res);
+    if (!p) return;
 
-    const result = await pool.request()
+    const result = await p.request()
       .input("provider_id", sql.Int, req.provider_id)
       .query(`
         SELECT 
@@ -230,10 +266,10 @@ app.post("/my/services", auth, async (req, res) => {
   }
 
   try {
-    const pool = await getPoolOr503(res);
-    if (!pool) return;
+    const p = await getPoolOr503(res);
+    if (!p) return;
 
-    await pool.request()
+    await p.request()
       .input("provider_id", sql.Int, req.provider_id)
       .input("name", sql.NVarChar, name)
       .input("price", sql.Decimal(10, 2), price)
@@ -255,10 +291,10 @@ app.post("/my/services", auth, async (req, res) => {
 --------------------------------------------- */
 app.get("/my/staff", auth, async (req, res) => {
   try {
-    const pool = await getPoolOr503(res);
-    if (!pool) return;
+    const p = await getPoolOr503(res);
+    if (!p) return;
 
-    const result = await pool.request()
+    const result = await p.request()
       .input("provider_id", sql.Int, req.provider_id)
       .query(`
         SELECT id, provider_id, full_name, role, phone, is_active, created_at
@@ -281,10 +317,10 @@ app.post("/my/staff", auth, async (req, res) => {
   }
 
   try {
-    const pool = await getPoolOr503(res);
-    if (!pool) return;
+    const p = await getPoolOr503(res);
+    if (!p) return;
 
-    const ins = await pool.request()
+    const ins = await p.request()
       .input("provider_id", sql.Int, req.provider_id)
       .input("full_name", sql.NVarChar(200), full_name)
       .input("role", sql.NVarChar(50), role)
@@ -307,15 +343,15 @@ app.post("/my/staff", auth, async (req, res) => {
 --------------------------------------------- */
 app.get("/providers/:id/services", async (req, res) => {
   try {
-    const pool = await getPoolOr503(res);
-    if (!pool) return;
+    const p = await getPoolOr503(res);
+    if (!p) return;
 
     const providerId = parseInt(req.params.id, 10);
     if (!providerId) {
       return res.status(400).json({ message: "Invalid provider id" });
     }
 
-    const result = await pool.request()
+    const result = await p.request()
       .input("pid", sql.Int, providerId)
       .query(`
         SELECT id, provider_id, name, price, duration_min
@@ -335,8 +371,8 @@ app.get("/providers/:id/services", async (req, res) => {
 --------------------------------------------- */
 app.get("/providers/:id/availability", async (req, res) => {
   try {
-    const pool = await getPoolOr503(res);
-    if (!pool) return;
+    const p = await getPoolOr503(res);
+    if (!p) return;
 
     const providerId = parseInt(req.params.id, 10);
     const { date, serviceId } = req.query;
@@ -345,7 +381,7 @@ app.get("/providers/:id/availability", async (req, res) => {
       return res.status(400).json({ message: "Missing providerId/date/serviceId" });
     }
 
-    const s = await pool.request()
+    const s = await p.request()
       .input("sid", sql.Int, parseInt(serviceId, 10))
       .query("SELECT duration_min FROM services WHERE id=@sid");
 
@@ -354,7 +390,7 @@ app.get("/providers/:id/availability", async (req, res) => {
 
     const dayOfWeek = new Date(`${date}T00:00:00`).getDay();
 
-    const wh = await pool.request()
+    const wh = await p.request()
       .input("pid", sql.Int, providerId)
       .input("dow", sql.Int, dayOfWeek)
       .query(`
@@ -372,7 +408,7 @@ app.get("/providers/:id/availability", async (req, res) => {
     const startTime = wh.recordset[0].start_time;
     const endTime = wh.recordset[0].end_time;
 
-    const b = await pool.request()
+    const b = await p.request()
       .input("pid", sql.Int, providerId)
       .input("d", sql.Date, new Date(`${date}T00:00:00`))
       .query(`
@@ -414,8 +450,8 @@ app.get("/providers/:id/availability", async (req, res) => {
 --------------------------------------------- */
 app.post("/bookings", async (req, res) => {
   try {
-    const pool = await getPoolOr503(res);
-    if (!pool) return;
+    const p = await getPoolOr503(res);
+    if (!p) return;
 
     const { providerId, serviceId, startAt, customerName, customerPhone } = req.body;
 
@@ -426,7 +462,7 @@ app.post("/bookings", async (req, res) => {
     const pid = parseInt(providerId, 10);
     const sid = parseInt(serviceId, 10);
 
-    const s = await pool.request()
+    const s = await p.request()
       .input("sid", sql.Int, sid)
       .query("SELECT duration_min FROM services WHERE id=@sid");
 
@@ -439,7 +475,7 @@ app.post("/bookings", async (req, res) => {
 
     const end = new Date(start.getTime() + durationMin * 60000);
 
-    const overlap = await pool.request()
+    const overlap = await p.request()
       .input("pid", sql.Int, pid)
       .input("startAt", sql.DateTime2, start)
       .input("endAt", sql.DateTime2, end)
@@ -456,7 +492,7 @@ app.post("/bookings", async (req, res) => {
       return res.status(409).json({ message: "Slot not available" });
     }
 
-    await pool.request()
+    await p.request()
       .input("pid", sql.Int, pid)
       .input("sid", sql.Int, sid)
       .input("customerName", sql.NVarChar(200), customerName)
@@ -481,15 +517,15 @@ app.post("/bookings", async (req, res) => {
 --------------------------------------------- */
 app.get("/my/bookings", auth, async (req, res) => {
   try {
-    const pool = await getPoolOr503(res);
-    if (!pool) return;
+    const p = await getPoolOr503(res);
+    if (!p) return;
 
     const { from, to } = req.query;
 
     const fromDt = from ? new Date(`${from}T00:00:00`) : null;
     const toDt = to ? new Date(`${to}T23:59:59`) : null;
 
-    const result = await pool.request()
+    const result = await p.request()
       .input("provider_id", sql.Int, req.provider_id)
       .input("fromDt", sql.DateTime2, fromDt)
       .input("toDt", sql.DateTime2, toDt)
@@ -519,13 +555,14 @@ app.get("/my/bookings", auth, async (req, res) => {
     res.status(500).json({ message: err.message });
   }
 });
+
 /* ---------------------------------------------
    BOOKINGS (cancel) - auth
 --------------------------------------------- */
 app.patch("/my/bookings/:id/cancel", auth, async (req, res) => {
   try {
-    const pool = await getPoolOr503(res);
-    if (!pool) return;
+    const p = await getPoolOr503(res);
+    if (!p) return;
 
     const bookingId = parseInt(req.params.id, 10);
     if (!bookingId) {
@@ -534,8 +571,7 @@ app.patch("/my/bookings/:id/cancel", auth, async (req, res) => {
 
     const reason = String(req.body?.reason || "").slice(0, 255);
 
-    // 1) Проверка: резервацията да е на този provider
-    const check = await pool.request()
+    const check = await p.request()
       .input("id", sql.Int, bookingId)
       .input("provider_id", sql.Int, req.provider_id)
       .query(`
@@ -548,8 +584,7 @@ app.patch("/my/bookings/:id/cancel", auth, async (req, res) => {
       return res.status(404).json({ message: "Booking not found" });
     }
 
-    // 2) Update: отменяме (soft delete)
-    await pool.request()
+    await p.request()
       .input("id", sql.Int, bookingId)
       .input("provider_id", sql.Int, req.provider_id)
       .input("reason", sql.NVarChar(255), reason || null)
@@ -569,15 +604,16 @@ app.patch("/my/bookings/:id/cancel", auth, async (req, res) => {
     return res.status(500).json({ message: e.message });
   }
 });
+
 /* ---------------------------------------------
    WORKING HOURS (dashboard) - auth
 --------------------------------------------- */
 app.get("/my/working-hours", auth, async (req, res) => {
   try {
-    const pool = await getPoolOr503(res);
-    if (!pool) return;
+    const p = await getPoolOr503(res);
+    if (!p) return;
 
-    const result = await pool.request()
+    const result = await p.request()
       .input("provider_id", sql.Int, req.provider_id)
       .query(`
         SELECT day_of_week, start_time, end_time
@@ -594,8 +630,8 @@ app.get("/my/working-hours", auth, async (req, res) => {
 
 app.put("/my/working-hours", auth, async (req, res) => {
   try {
-    const pool = await getPoolOr503(res);
-    if (!pool) return;
+    const p = await getPoolOr503(res);
+    if (!p) return;
 
     const { hours } = req.body;
 
@@ -603,7 +639,7 @@ app.put("/my/working-hours", auth, async (req, res) => {
       return res.status(400).json({ message: "Invalid payload" });
     }
 
-    await pool.request()
+    await p.request()
       .input("provider_id", sql.Int, req.provider_id)
       .query(`DELETE FROM provider_working_hours WHERE provider_id=@provider_id`);
 
@@ -615,7 +651,7 @@ app.put("/my/working-hours", auth, async (req, res) => {
       if (!(dow >= 0 && dow <= 6)) continue;
       if (!st || !et) continue;
 
-      await pool.request()
+      await p.request()
         .input("provider_id", sql.Int, req.provider_id)
         .input("dow", sql.Int, dow)
         .input("st", sql.VarChar(5), st)
@@ -639,5 +675,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 API running on port ${PORT}`);
 });
-
 
