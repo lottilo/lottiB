@@ -510,6 +510,7 @@ app.get("/my/bookings", auth, async (req, res) => {
         WHERE b.provider_id = @provider_id
           AND (@fromDt IS NULL OR b.start_at >= @fromDt)
           AND (@toDt IS NULL OR b.start_at <= @toDt)
+          AND b.status <> 'cancelled'
         ORDER BY b.start_at DESC
       `);
 
@@ -518,7 +519,56 @@ app.get("/my/bookings", auth, async (req, res) => {
     res.status(500).json({ message: err.message });
   }
 });
+/* ---------------------------------------------
+   BOOKINGS (cancel) - auth
+--------------------------------------------- */
+app.patch("/my/bookings/:id/cancel", auth, async (req, res) => {
+  try {
+    const pool = await getPoolOr503(res);
+    if (!pool) return;
 
+    const bookingId = parseInt(req.params.id, 10);
+    if (!bookingId) {
+      return res.status(400).json({ message: "Invalid booking id" });
+    }
+
+    const reason = String(req.body?.reason || "").slice(0, 255);
+
+    // 1) Проверка: резервацията да е на този provider
+    const check = await pool.request()
+      .input("id", sql.Int, bookingId)
+      .input("provider_id", sql.Int, req.provider_id)
+      .query(`
+        SELECT TOP (1) id, status
+        FROM bookings
+        WHERE id = @id AND provider_id = @provider_id
+      `);
+
+    if (!check.recordset.length) {
+      return res.status(404).json({ message: "Booking not found" });
+    }
+
+    // 2) Update: отменяме (soft delete)
+    await pool.request()
+      .input("id", sql.Int, bookingId)
+      .input("provider_id", sql.Int, req.provider_id)
+      .input("reason", sql.NVarChar(255), reason || null)
+      .input("by", sql.NVarChar(100), `provider:${req.provider_id}`)
+      .query(`
+        UPDATE bookings
+        SET status = 'cancelled',
+            cancelled_at = SYSUTCDATETIME(),
+            cancelled_reason = @reason,
+            cancelled_by = @by
+        WHERE id = @id AND provider_id = @provider_id
+      `);
+
+    return res.json({ message: "Резервацията е отменена" });
+  } catch (e) {
+    console.error("cancel booking error:", e);
+    return res.status(500).json({ message: e.message });
+  }
+});
 /* ---------------------------------------------
    WORKING HOURS (dashboard) - auth
 --------------------------------------------- */
