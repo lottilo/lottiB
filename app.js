@@ -724,6 +724,188 @@ app.post("/my/bookings", auth, async (req, res) => {
   }
 });
 /* ---------------------------------------------
+   BOOKINGS (edit) - auth
+   PATCH /my/bookings/:id
+--------------------------------------------- */
+app.patch("/my/bookings/:id", auth, async (req, res) => {
+  try {
+    const p = await getPoolOr503(res);
+    if (!p) return;
+
+    const bookingId = parseInt(req.params.id, 10);
+    if (!bookingId) return res.status(400).json({ message: "Invalid booking id" });
+
+    const {
+      serviceId,
+      startAt,
+      endAt,
+      customerName,
+      customerPhone,
+      status,
+    } = req.body || {};
+
+    // fetch + ownership check
+    const cur = await p.request()
+      .input("id", sql.Int, bookingId)
+      .input("pid", sql.Int, req.provider_id)
+      .query(`
+        SELECT TOP(1) *
+        FROM bookings
+        WHERE id=@id AND provider_id=@pid
+      `);
+
+    if (!cur.recordset.length) return res.status(404).json({ message: "Booking not found" });
+
+    // if changing serviceId -> verify ownership
+    let sid = null;
+    if (serviceId != null) {
+      sid = parseInt(serviceId, 10);
+      if (!sid) return res.status(400).json({ message: "Invalid serviceId" });
+
+      const s = await p.request()
+        .input("sid", sql.Int, sid)
+        .input("pid", sql.Int, req.provider_id)
+        .query("SELECT TOP(1) id FROM services WHERE id=@sid AND provider_id=@pid");
+
+      if (!s.recordset.length) return res.status(404).json({ message: "Service not found for this provider" });
+    }
+
+    // dates
+    let start = null;
+    let end = null;
+    if (startAt != null || endAt != null) {
+      start = startAt != null ? new Date(startAt) : new Date(cur.recordset[0].start_at);
+      end = endAt != null ? new Date(endAt) : new Date(cur.recordset[0].end_at);
+
+      if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+        return res.status(400).json({ message: "Invalid startAt/endAt" });
+      }
+      if (end <= start) return res.status(400).json({ message: "endAt must be after startAt" });
+
+      // overlap check (excluding this booking)
+      const overlap = await p.request()
+        .input("pid", sql.Int, req.provider_id)
+        .input("id", sql.Int, bookingId)
+        .input("startAt", sql.DateTime2, start)
+        .input("endAt", sql.DateTime2, end)
+        .query(`
+          SELECT TOP (1) id
+          FROM bookings
+          WHERE provider_id = @pid
+            AND id <> @id
+            AND status <> 'cancelled'
+            AND start_at < @endAt
+            AND end_at > @startAt
+        `);
+
+      if (overlap.recordset.length) {
+        return res.status(409).json({ message: "Slot not available" });
+      }
+    }
+
+    const newStatus = status ? String(status).slice(0, 20) : null;
+    const newName = customerName != null ? String(customerName).slice(0, 200) : null;
+    const newPhone = customerPhone != null ? String(customerPhone).slice(0, 50) : null;
+
+    await p.request()
+      .input("id", sql.Int, bookingId)
+      .input("pid", sql.Int, req.provider_id)
+      .input("sid", sql.Int, sid ?? cur.recordset[0].service_id)
+      .input("customerName", sql.NVarChar(200), newName ?? cur.recordset[0].customer_name)
+      .input("customerPhone", sql.NVarChar(50), newPhone ?? cur.recordset[0].customer_phone)
+      .input("startAt", sql.DateTime2, start ?? cur.recordset[0].start_at)
+      .input("endAt", sql.DateTime2, end ?? cur.recordset[0].end_at)
+      .input("status", sql.NVarChar(20), newStatus ?? cur.recordset[0].status)
+      .query(`
+        UPDATE bookings
+        SET service_id=@sid,
+            customer_name=@customerName,
+            customer_phone=@customerPhone,
+            start_at=@startAt,
+            end_at=@endAt,
+            status=@status
+        WHERE id=@id AND provider_id=@pid
+      `);
+
+    return res.json({ message: "Резервацията е обновена" });
+  } catch (e) {
+    console.error("edit booking error:", e);
+    return res.status(500).json({ message: e.message });
+  }
+});
+/* ---------------------------------------------
+   SERVICES (edit) - auth
+--------------------------------------------- */
+app.put("/my/services/:id", auth, async (req, res) => {
+  try {
+    const p = await getPoolOr503(res);
+    if (!p) return;
+
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ message: "Invalid service id" });
+
+    const { name, price, duration_min, staff_id } = req.body || {};
+    if (!name || price == null) return res.status(400).json({ message: "Missing name/price" });
+
+    // ownership check
+    const check = await p.request()
+      .input("id", sql.Int, id)
+      .input("pid", sql.Int, req.provider_id)
+      .query("SELECT TOP(1) id FROM services WHERE id=@id AND provider_id=@pid");
+
+    if (!check.recordset.length) return res.status(404).json({ message: "Service not found" });
+
+    await p.request()
+      .input("id", sql.Int, id)
+      .input("pid", sql.Int, req.provider_id)
+      .input("name", sql.NVarChar(200), String(name).slice(0, 200))
+      .input("price", sql.Decimal(10, 2), price)
+      .input("duration_min", sql.Int, Number(duration_min || 60))
+      .input("staff_id", sql.Int, staff_id ?? null)
+      .query(`
+        UPDATE services
+        SET name=@name, price=@price, duration_min=@duration_min, staff_id=@staff_id
+        WHERE id=@id AND provider_id=@pid
+      `);
+
+    return res.json({ message: "Услугата е обновена" });
+  } catch (e) {
+    console.error("edit service error:", e);
+    return res.status(500).json({ message: e.message });
+  }
+});
+
+/* ---------------------------------------------
+   SERVICES (delete) - auth
+--------------------------------------------- */
+app.delete("/my/services/:id", auth, async (req, res) => {
+  try {
+    const p = await getPoolOr503(res);
+    if (!p) return;
+
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ message: "Invalid service id" });
+
+    // ownership check
+    const check = await p.request()
+      .input("id", sql.Int, id)
+      .input("pid", sql.Int, req.provider_id)
+      .query("SELECT TOP(1) id FROM services WHERE id=@id AND provider_id=@pid");
+
+    if (!check.recordset.length) return res.status(404).json({ message: "Service not found" });
+
+    await p.request()
+      .input("id", sql.Int, id)
+      .input("pid", sql.Int, req.provider_id)
+      .query("DELETE FROM services WHERE id=@id AND provider_id=@pid");
+
+    return res.json({ message: "Услугата е изтрита" });
+  } catch (e) {
+    console.error("delete service error:", e);
+    return res.status(500).json({ message: e.message });
+  }
+});
+/* ---------------------------------------------
    BOOKINGS (cancel) - auth
 --------------------------------------------- */
 app.patch("/my/bookings/:id/cancel", auth, async (req, res) => {
