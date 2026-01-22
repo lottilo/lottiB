@@ -285,7 +285,95 @@ app.post("/my/services", auth, async (req, res) => {
     res.status(500).json({ message: err.message });
   }
 });
+/* ---------------------------------------------
+   SERVICES (edit/delete) - auth
+--------------------------------------------- */
+app.put("/my/services/:id", auth, async (req, res) => {
+  try {
+    const p = await getPoolOr503(res);
+    if (!p) return;
 
+    const serviceId = parseInt(req.params.id, 10);
+    if (!serviceId) return res.status(400).json({ message: "Invalid service id" });
+
+    const { name, price, duration_min, staff_id } = req.body;
+
+    // basic validation (allow partial updates? here we expect full payload)
+    if (!name || price == null) {
+      return res.status(400).json({ message: "Липсват задължителни полета" });
+    }
+
+    const upd = await p.request()
+      .input("provider_id", sql.Int, req.provider_id)
+      .input("id", sql.Int, serviceId)
+      .input("name", sql.NVarChar, name)
+      .input("price", sql.Decimal(10, 2), price)
+      .input("duration_min", sql.Int, duration_min || 60)
+      .input("staff_id", sql.Int, staff_id ?? null)
+      .query(`
+        UPDATE services
+        SET name = @name,
+            price = @price,
+            duration_min = @duration_min,
+            staff_id = @staff_id
+        WHERE id = @id AND provider_id = @provider_id;
+
+        SELECT @@ROWCOUNT AS affected;
+      `);
+
+    const affected = upd.recordset?.[0]?.affected || 0;
+    if (!affected) return res.status(404).json({ message: "Service not found" });
+
+    return res.json({ message: "Услугата е обновена" });
+  } catch (err) {
+    return res.status(500).json({ message: err.message });
+  }
+});
+
+app.delete("/my/services/:id", auth, async (req, res) => {
+  try {
+    const p = await getPoolOr503(res);
+    if (!p) return;
+
+    const serviceId = parseInt(req.params.id, 10);
+    if (!serviceId) return res.status(400).json({ message: "Invalid service id" });
+
+    // Optional guard: if there are future bookings for this service, refuse delete.
+    // If you prefer hard-delete always, remove this check.
+    const future = await p.request()
+      .input("provider_id", sql.Int, req.provider_id)
+      .input("sid", sql.Int, serviceId)
+      .query(`
+        SELECT TOP (1) b.id
+        FROM bookings b
+        WHERE b.provider_id = @provider_id
+          AND b.service_id = @sid
+          AND b.status <> 'cancelled'
+          AND b.start_at >= SYSUTCDATETIME()
+      `);
+
+    if (future.recordset.length) {
+      return res.status(409).json({ message: "Има бъдещи резервации за тази услуга. Първо ги отмени/премести." });
+    }
+
+    const del = await p.request()
+      .input("provider_id", sql.Int, req.provider_id)
+      .input("id", sql.Int, serviceId)
+      .query(`
+        DELETE FROM services
+        WHERE id = @id AND provider_id = @provider_id;
+
+        SELECT @@ROWCOUNT AS affected;
+      `);
+
+    const affected = del.recordset?.[0]?.affected || 0;
+    if (!affected) return res.status(404).json({ message: "Service not found" });
+
+    return res.json({ message: "Услугата е изтрита" });
+  } catch (err) {
+    return res.status(500).json({ message: err.message });
+  }
+});
 /* ---------------------------------------------
    STAFF (dashboard)
 --------------------------------------------- */
@@ -546,7 +634,6 @@ app.get("/my/bookings", auth, async (req, res) => {
         WHERE b.provider_id = @provider_id
           AND (@fromDt IS NULL OR b.start_at >= @fromDt)
           AND (@toDt IS NULL OR b.start_at <= @toDt)
-          AND b.status <> 'cancelled'
         ORDER BY b.start_at DESC
       `);
 
@@ -555,7 +642,87 @@ app.get("/my/bookings", auth, async (req, res) => {
     res.status(500).json({ message: err.message });
   }
 });
+/* ---------------------------------------------
+   BOOKINGS (dashboard creates booking) - auth
+   manual endAt
+--------------------------------------------- */
+app.post("/my/bookings", auth, async (req, res) => {
+  try {
+    const p = await getPoolOr503(res);
+    if (!p) return;
 
+    const { serviceId, startAt, endAt, customerName, customerPhone } = req.body;
+
+    if (!serviceId || !startAt || !endAt || !customerName || !customerPhone) {
+      return res.status(400).json({ message: "Missing fields" });
+    }
+
+    const sid = parseInt(serviceId, 10);
+    if (!sid) return res.status(400).json({ message: "Invalid serviceId" });
+
+    const start = new Date(startAt);
+    const end = new Date(endAt);
+
+    if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+      return res.status(400).json({ message: "Invalid startAt/endAt" });
+    }
+
+    if (end <= start) {
+      return res.status(400).json({ message: "endAt must be after startAt" });
+    }
+
+    // ✅ ensure service belongs to this provider (security)
+    const svc = await p.request()
+      .input("sid", sql.Int, sid)
+      .input("pid", sql.Int, req.provider_id)
+      .query(`
+        SELECT TOP (1) id
+        FROM services
+        WHERE id = @sid AND provider_id = @pid
+      `);
+
+    if (!svc.recordset.length) {
+      return res.status(404).json({ message: "Service not found for this provider" });
+    }
+
+    // ✅ overlap check (ignore cancelled)
+    const overlap = await p.request()
+      .input("pid", sql.Int, req.provider_id)
+      .input("startAt", sql.DateTime2, start)
+      .input("endAt", sql.DateTime2, end)
+      .query(`
+        SELECT TOP (1) id
+        FROM bookings
+        WHERE provider_id = @pid
+          AND status <> 'cancelled'
+          AND start_at < @endAt
+          AND end_at > @startAt
+      `);
+
+    if (overlap.recordset.length) {
+      return res.status(409).json({ message: "Slot not available" });
+    }
+
+    const ins = await p.request()
+      .input("pid", sql.Int, req.provider_id)
+      .input("sid", sql.Int, sid)
+      .input("customerName", sql.NVarChar(200), String(customerName).trim())
+      .input("customerPhone", sql.NVarChar(50), String(customerPhone).trim())
+      .input("startAt", sql.DateTime2, start)
+      .input("endAt", sql.DateTime2, end)
+      .input("status", sql.NVarChar(20), "confirmed")
+      .query(`
+        INSERT INTO bookings (provider_id, service_id, customer_name, customer_phone, start_at, end_at, status)
+        OUTPUT INSERTED.id
+        VALUES (@pid, @sid, @customerName, @customerPhone, @startAt, @endAt, @status)
+      `);
+
+    return res.status(201).json({ message: "Часът е записан", id: ins.recordset[0].id });
+  } catch (e) {
+    console.error("dashboard create booking error:", e);
+    return res.status(500).json({ message: e.message });
+  }
+});
 /* ---------------------------------------------
    BOOKINGS (cancel) - auth
 --------------------------------------------- */
